@@ -1,7 +1,7 @@
+import 'dotenv/config'; // IMPORTANT: .env încărcat la start
 import express from 'express';
 import http from 'http';
 import cors from 'cors';
-import dotenv from 'dotenv';
 import { WebSocketServer } from 'ws';
 import { Client as SSHClient } from 'ssh2';
 import fs from 'fs/promises';
@@ -9,7 +9,8 @@ import fssync from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-dotenv.config();
+import passport from 'passport';
+import authRoutes, { requireAuth } from './auth.js';
 
 // --- căi & utilitare ---
 const __filename = fileURLToPath(import.meta.url);
@@ -18,41 +19,41 @@ const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.cwd(), process.env.
 const SERVERS_PATH = path.join(DATA_DIR, 'servers.json');
 
 async function ensureDataFile() {
-    if (!fssync.existsSync(DATA_DIR)) fssync.mkdirSync(DATA_DIR, { recursive: true });
-    if (!fssync.existsSync(SERVERS_PATH)) fssync.writeFileSync(SERVERS_PATH, '[]', 'utf8');
+  if (!fssync.existsSync(DATA_DIR)) fssync.mkdirSync(DATA_DIR, { recursive: true });
+  if (!fssync.existsSync(SERVERS_PATH)) fssync.writeFileSync(SERVERS_PATH, '[]', 'utf8');
 }
 
 async function readServers() {
-    await ensureDataFile();
-    const raw = (await fs.readFile(SERVERS_PATH, 'utf8')).trim();
-    if (!raw) return [];
-    try { return JSON.parse(raw); } catch { return []; }
+  await ensureDataFile();
+  const raw = (await fs.readFile(SERVERS_PATH, 'utf8')).trim();
+  if (!raw) return [];
+  try { return JSON.parse(raw); } catch { return []; }
 }
 async function writeServersAtomic(list) {
-    await ensureDataFile();
-    const tmp = SERVERS_PATH + '.tmp';
-    await fs.writeFile(tmp, JSON.stringify(list, null, 2), 'utf8');
-    await fs.rename(tmp, SERVERS_PATH);
+  await ensureDataFile();
+  const tmp = SERVERS_PATH + '.tmp';
+  await fs.writeFile(tmp, JSON.stringify(list, null, 2), 'utf8');
+  await fs.rename(tmp, SERVERS_PATH);
 }
 
 // validare minimă
 function validateServerPayload(body, { partial = false } = {}) {
-    const required = ['name', 'host', 'username'];
-    if (!partial) {
-        for (const k of required) if (!body?.[k]) throw new Error(`Câmp lipsă: ${k}`);
-    }
-    if (body?.port != null) {
-        const p = Number(body.port);
-        if (!Number.isInteger(p) || p < 1 || p > 65535) throw new Error('Port invalid');
-    }
+  const required = ['name', 'host', 'username'];
+  if (!partial) {
+    for (const k of required) if (!body?.[k]) throw new Error(`Câmp lipsă: ${k}`);
+  }
+  if (body?.port != null) {
+    const p = Number(body.port);
+    if (!Number.isInteger(p) || p < 1 || p > 65535) throw new Error('Port invalid');
+  }
 }
 
 // --- config restricții host (opțional) ---
 const ALLOWED = (process.env.ALLOWED_SSH_HOSTS || '')
-    .split(',').map(s => s.trim()).filter(Boolean);
+  .split(',').map(s => s.trim()).filter(Boolean);
 function assertAllowedHost(host) {
-    if (!ALLOWED.length) return;
-    if (!ALLOWED.includes(host)) throw new Error(`Host ${host} nu este permis`);
+  if (!ALLOWED.length) return;
+  if (!ALLOWED.includes(host)) throw new Error(`Host ${host} nu este permis`);
 }
 
 // --- app/websocket ---
@@ -60,16 +61,18 @@ const app = express();
 app.use(express.json());
 app.use(cors({ origin: process.env.CORS_ORIGIN?.split(',') || true, credentials: true }));
 
+// init passport + rute auth (acum că avem app)
+app.use(passport.initialize());
+app.use('/api/auth', authRoutes);
+
 const httpServer = http.createServer(app);
 const wss = new WebSocketServer({ server: httpServer, path: '/ws/ssh' });
 
 // ---------- API REST: CRUD pe servers.json (protejate cu JWT) ----------
 app.get('/api/servers', requireAuth, async (req, res) => {
   const list = await readServers();
-  const my = list.filter(s => s.ownerId === req.user.id);
-  res.json(my);
+  res.json(list);
 });
-
 
 app.post('/api/servers', requireAuth, async (req, res) => {
   try {
@@ -82,18 +85,11 @@ app.post('/api/servers', requireAuth, async (req, res) => {
       host: req.body.host,
       port: req.body.port ?? 22,
       username: req.body.username,
-      ownerId: req.user.id,            // <-- AICI
-      sharedWith: Array.isArray(req.body.sharedWith) ? req.body.sharedWith : undefined,
       tags: Array.isArray(req.body.tags) ? req.body.tags : undefined,
       note: req.body.note ?? undefined,
     };
-    if (list.some(s =>
-      s.ownerId === req.user.id && // unicitate în spațiul meu
-      s.host === server.host &&
-      s.username === server.username &&
-      (s.port ?? 22) === (server.port ?? 22)
-    )) {
-      return res.status(409).json({ error: 'Server deja există (host+username+port) pentru acest utilizator' });
+    if (list.some(s => s.host === server.host && s.username === server.username && (s.port ?? 22) === (server.port ?? 22))) {
+      return res.status(409).json({ error: 'Server deja există (host+username+port)' });
     }
     await writeServersAtomic([...list, server]);
     res.status(201).json(server);
@@ -102,20 +98,15 @@ app.post('/api/servers', requireAuth, async (req, res) => {
   }
 });
 
-
 app.put('/api/servers/:id', requireAuth, async (req, res) => {
   try {
     validateServerPayload(req.body, { partial: true });
     const list = await readServers();
     const idx = list.findIndex(s => s.id === req.params.id);
     if (idx === -1) return res.status(404).json({ error: 'Server inexistent' });
-    if (list[idx].ownerId !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
-
     const merged = { ...list[idx], ...req.body };
-    // verifică unicitatea doar în spațiul userului curent
     if (list.some(s =>
       s.id !== merged.id &&
-      s.ownerId === req.user.id &&
       s.host === merged.host &&
       s.username === merged.username &&
       (s.port ?? 22) === (merged.port ?? 22)
@@ -134,34 +125,33 @@ app.delete('/api/servers/:id', requireAuth, async (req, res) => {
   const list = await readServers();
   const idx = list.findIndex(s => s.id === req.params.id);
   if (idx === -1) return res.status(404).json({ error: 'Server inexistent' });
-  if (list[idx].ownerId !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
-
   const [removed] = list.splice(idx, 1);
   await writeServersAtomic(list);
   res.json(removed);
 });
 
-
 // ---------- WebSocket SSH (opțional protejat cu JWT) ----------
 const USE_AUTH = process.env.USE_AUTH !== 'false';
 
 wss.on('connection', (ws) => {
-    let ssh, stream;
-    let alive = true;
+  let ssh, stream;
+  let alive = true;
 
   ws.on('message', async (raw) => {
     if (!ssh) {
+      // Primul mesaj: { serverId, cols, rows, auth: { password | privateKey }, token? }
       let cfg;
       try { cfg = JSON.parse(raw.toString()); }
       catch { ws.close(1008, 'Primul mesaj trebuie să fie JSON'); return; }
 
-      let userId = null;
       if (USE_AUTH) {
         try {
-          if (!cfg.token) throw new Error('Missing JWT');
-          const payload = jwt.verify(cfg.token, process.env.JWT_SECRET);
-          userId = payload.id;                          // <-- AICI
-        } catch {
+          const t = cfg.token;
+          if (!t) throw new Error('Missing JWT');
+          // simplu: verificăm cu secretn
+          const payload = await import('jsonwebtoken').then(m => m.default.verify(t, process.env.JWT_SECRET));
+          // (payload disponibil dacă vrei să-l folosești)
+        } catch (e) {
           ws.close(1008, 'JWT invalid');
           return;
         }
@@ -170,61 +160,56 @@ wss.on('connection', (ws) => {
       const servers = await readServers();
       const srv = servers.find(s => s.id === cfg.serverId);
       if (!srv) { ws.close(1008, 'Server necunoscut'); return; }
-
-      // doar proprietarul (sau, opțional, sharedWith)
-      const allowed = srv.ownerId === userId || (Array.isArray(srv.sharedWith) && srv.sharedWith.includes(userId));
-      if (USE_AUTH && !allowed) { ws.close(1008, 'Forbidden'); return; }
-
       try { assertAllowedHost(srv.host); } catch (e) { ws.close(1008, e.message); return; }
 
-            ssh = new SSHClient();
-            ssh
-                .on('keyboard-interactive', (name, instructions, lang, prompts, finish) => {
-                    const answers = prompts.map(() => cfg.auth?.password || '');
-                    finish(answers);
-                })
-                .on('ready', () => {
-                    console.log('[SSH] ready', srv.host, srv.port);
-                    ssh.shell({ term: 'xterm-256color', cols: cfg.cols || 80, rows: cfg.rows || 24 }, (err, s) => {
-                        if (err) { ws.close(1011, `PTY error: ${err.message}`); return; }
-                        stream = s;
-                        stream.on('data', d => alive && ws.send(d));
-                        stream.stderr?.on('data', d => alive && ws.send(d));
-                        stream.on('close', () => { try { ws.close(); } catch { } });
-                    });
-                })
-                .on('error', (e) => {
-                    console.error('[SSH ERROR]', e.message);
-                    try { ws.send(Buffer.from(`\r\n[SSH ERROR] ${e.message}\r\n`)); } catch { }
-                    try { ws.close(); } catch { }
-                })
-                .connect({
-                    host: srv.host,
-                    port: srv.port || 22,
-                    username: srv.username,
-                    password: cfg.auth?.password,
-                    privateKey: cfg.auth?.privateKey,
-                    tryKeyboard: true
-                });
+      ssh = new SSHClient();
+      ssh
+        .on('keyboard-interactive', (name, instructions, lang, prompts, finish) => {
+          const answers = prompts.map(() => cfg.auth?.password || '');
+          finish(answers);
+        })
+        .on('ready', () => {
+          console.log('[SSH] ready', srv.host, srv.port);
+          ssh.shell({ term: 'xterm-256color', cols: cfg.cols || 80, rows: cfg.rows || 24 }, (err, s) => {
+            if (err) { ws.close(1011, `PTY error: ${err.message}`); return; }
+            stream = s;
+            stream.on('data', d => alive && ws.send(d));
+            stream.stderr?.on('data', d => alive && ws.send(d));
+            stream.on('close', () => { try { ws.close(); } catch {} });
+          });
+        })
+        .on('error', (e) => {
+          console.error('[SSH ERROR]', e.message);
+          try { ws.send(Buffer.from(`\r\n[SSH ERROR] ${e.message}\r\n`)); } catch {}
+          try { ws.close(); } catch {}
+        })
+        .connect({
+          host: srv.host,
+          port: srv.port || 22,
+          username: srv.username,
+          password: cfg.auth?.password,
+          privateKey: cfg.auth?.privateKey,
+          tryKeyboard: true
+        });
 
-        } else {
-            // Mesaje ulterioare: resize sau input
-            try {
-                const msg = JSON.parse(raw.toString());
-                if (msg.type === 'resize' && stream) {
-                    stream.setWindow(msg.rows, msg.cols, msg.cols * 8, msg.rows * 16);
-                    return;
-                }
-            } catch { }
-            if (stream) stream.write(raw);
+    } else {
+      // Mesaje ulterioare: resize sau input
+      try {
+        const msg = JSON.parse(raw.toString());
+        if (msg.type === 'resize' && stream) {
+          stream.setWindow(msg.rows, msg.cols, msg.cols * 8, msg.rows * 16);
+          return;
         }
-    });
+      } catch {}
+      if (stream) stream.write(raw);
+    }
+  });
 
-    ws.on('close', () => {
-        alive = false;
-        try { stream?.close(); } catch { }
-        try { ssh?.end(); } catch { }
-    });
+  ws.on('close', () => {
+    alive = false;
+    try { stream?.close(); } catch {}
+    try { ssh?.end(); } catch {}
+  });
 });
 
 // --- start ---
