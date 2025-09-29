@@ -1,10 +1,11 @@
 [
   {
-    "id": "4b0iwu86",
-    "name": "Test",
+    "id": "tlk1bf7l",
+    "name": "test",
     "host": "antonio-dev.go.ro",
     "port": 15621,
     "username": "antonio",
+    "ownerId": "1759161864528",
     "tags": [
       "dev"
     ],

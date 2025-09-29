@@ -11,19 +11,24 @@ const SERVERS_PATH = path.join(DATA_DIR, 'servers.json');
 const nanoid = customAlphabet('0123456789abcdefghijklmnopqrstuvwxyz', 10);
 
 
+// schema (unde ai ServerSchema)
 export const ServerSchema = z.object({
-    id: z.string().min(1),
-    name: z.string().min(1),
-    host: z.string().min(1),
-    port: z.number().int().min(1).max(65535).default(22),
-    username: z.string().min(1),
-    // câmpuri opționale de UX
-    tags: z.array(z.string()).optional(),
-    note: z.string().optional()
+  id: z.string().min(1),
+  name: z.string().min(1),
+  host: z.string().min(1),
+  port: z.number().int().min(1).max(65535).default(22),
+  username: z.string().min(1),
+  // ownership
+  ownerId: z.string().min(1),
+  // opțional: partajare
+  sharedWith: z.array(z.string()).optional(),
+  // UX
+  tags: z.array(z.string()).optional(),
+  note: z.string().optional()
 });
 
+export const NewServerSchema = ServerSchema.omit({ id: true, ownerId: true }).partial({ port: true });
 
-export const NewServerSchema = ServerSchema.omit({ id: true }).partial({ port: true });
 async function ensureDataDir() {
     await fs.mkdir(DATA_DIR, { recursive: true });
     try { await fs.access(SERVERS_PATH); }
