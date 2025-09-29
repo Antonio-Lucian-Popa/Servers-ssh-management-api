@@ -1,12 +1,12 @@
 [
   {
-    "id": "ik99qmo0",
+    "id": "4b0iwu86",
     "name": "Test",
     "host": "antonio-dev.go.ro",
-    "port": 15622,
+    "port": 15621,
     "username": "antonio",
     "tags": [
-      "Dev"
+      "dev"
     ],
     "note": ""
   }
